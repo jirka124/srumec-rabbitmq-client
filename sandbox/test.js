@@ -2,13 +2,23 @@ import { RabbitClient } from "../js/index.js";
 
 const RABBIT_URL = process.env.RABBITMQ_URL || "amqp://localhost:5672";
 
-console.log(process.env.RABBITMQ_URL, "amqp://localhost:5672");
-
 const rabbit1 = new RabbitClient(RABBIT_URL);
 const rabbit2 = new RabbitClient(RABBIT_URL);
 
 const consumeFunction = async (content, ctx, queue) => {
-  console.log("Received message:", content, queue, ctx.fields.consumerTag);
+  if (ctx.properties.correlationId && ctx.properties.replyTo) {
+    if (content?.key === "add_numbers") {
+      rabbit2.answerRPC(ctx, {
+        result: Number(content?.op1) + Number(content?.op2),
+      });
+    } else {
+      rabbit2.answerRPC(ctx, {
+        result: "unknown key: " + content?.key,
+      });
+    }
+  } else {
+    console.log("Received message:", content, queue, ctx.fields.consumerTag);
+  }
 };
 
 (async () => {
@@ -29,10 +39,10 @@ const consumeFunction = async (content, ctx, queue) => {
   await rabbit2.assertQueue(QUEUE_3, { durable: false });
 
   await rabbit1.bindQueue(QUEUE_1, EXCHANGE, "sandbox"); // load-balance any sandbox
-  await rabbit1.bindQueue(QUEUE_2, EXCHANGE, "sandbox.1"); // unique reply to queue
+  await rabbit1.bindQueue(QUEUE_2, EXCHANGE, "sandbox.1"); // unique direct queue
   await rabbit1.bindQueue(QUEUE_2, EXCHANGE, "orange.*"); // subscribe to any event interested
   await rabbit2.bindQueue(QUEUE_1, EXCHANGE, "sandbox"); // load-balance any sandbox
-  await rabbit2.bindQueue(QUEUE_3, EXCHANGE, "sandbox.2"); // unique reply to queue
+  await rabbit2.bindQueue(QUEUE_3, EXCHANGE, "sandbox.2"); // unique direct queue
   await rabbit2.bindQueue(QUEUE_3, EXCHANGE, "apple.*"); // subscribe to any event interested
 
   await rabbit1.consume(QUEUE_1, consumeFunction);
@@ -55,4 +65,13 @@ const consumeFunction = async (content, ctx, queue) => {
   rabbit1.publish(EXCHANGE, "apple.delete", {
     message: "From sandbox-1 to subscribers of apple (sandbox-2)",
   });
+  const reqParams = {
+    key: "add_numbers",
+    op1: 45,
+    op2: 56,
+  };
+  const res1 = await rabbit1.publishRPC(EXCHANGE, "sandbox.2", reqParams);
+  console.log(
+    `RPC returned (${reqParams.op1} + ${reqParams.op2}) = ${res1.result}`
+  );
 })();

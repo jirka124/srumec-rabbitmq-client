@@ -1,7 +1,8 @@
 import amqp from "amqplib";
+import { randomUUID } from "crypto";
 
 export class RabbitClient {
-  constructor(url) {
+  constructor(url, replyQueueName) {
     this.url = url || "amqp://rabbitmq:5672";
     this.connection = null;
     this.channel = null;
@@ -13,6 +14,10 @@ export class RabbitClient {
 
     this.offlineQueue = []; // buffer to flush as soon as connection goes up again
     this.isConnectionReady = false;
+
+    this.replyQueue =
+      replyQueueName || `rpc_reply_${Math.random().toString(16).slice(2)}`;
+    this.pendingRPC = new Map(); // correlationId -> { resolve, reject, timer }
   }
 
   async connect(retries = 10) {
@@ -24,6 +29,20 @@ export class RabbitClient {
         this.isConnectionReady = true;
         this._registerConnectionHandlers();
         console.log("Connected to RabbitMQ");
+
+        await this.assertQueue(this.replyQueue, {
+          durable: false,
+          exclusive: true,
+        });
+        await this.consume(this.replyQueue, async (content, ctx) => {
+          const corrId = ctx.properties.correlationId;
+          if (corrId && this.pendingRPC.has(corrId)) {
+            const { resolve, timer } = this.pendingRPC.get(corrId);
+            clearTimeout(timer);
+            this.pendingRPC.delete(corrId);
+            resolve(content);
+          }
+        });
         return;
       } catch (err) {
         this.isConnectionReady = false;
@@ -91,10 +110,18 @@ export class RabbitClient {
     while (this.offlineQueue.length > 0) {
       const msg = this.offlineQueue.shift();
       try {
-        this.channel.publish(msg.exchange, msg.routingKey, msg.payload, {
-          persistent: true,
-        });
-        console.log(`Flushed message to ${msg.exchange}:${msg.routingKey}`);
+        if (msg.type === "rpc-response") {
+          this.channel.sendToQueue(msg.replyTo, msg.payload, {
+            correlationId: msg.correlationId,
+            persistent: true,
+          });
+          console.log(`Flushed RPC response to ${msg.replyTo}`);
+        } else {
+          this.channel.publish(msg.exchange, msg.routingKey, msg.payload, {
+            persistent: true,
+          });
+          console.log(`Flushed message to ${msg.exchange}:${msg.routingKey}`);
+        }
       } catch (err) {
         console.error("Failed to flush queued message:", err.message);
         this.offlineQueue.unshift(msg);
@@ -135,12 +162,13 @@ export class RabbitClient {
     );
   }
 
-  publish(exchange, routingKey, message) {
+  publish(exchange, routingKey, message, options) {
     const payload = Buffer.from(JSON.stringify(message));
     const sendMessage = () => {
       try {
         this.channel.publish(exchange, routingKey, payload, {
           persistent: true,
+          ...options,
         });
         console.log(`Sent to exchange "${exchange}" (${routingKey})`);
       } catch (err) {
@@ -154,6 +182,68 @@ export class RabbitClient {
     } else {
       console.warn("Channel not ready — message queued");
       this.offlineQueue.push({ exchange, routingKey, payload });
+    }
+  }
+
+  publishRPC(exchange, routingKey, message, options, timeout = 5000) {
+    return new Promise((resolve, reject) => {
+      const correlationId = randomUUID();
+      const payload = Buffer.from(JSON.stringify(message));
+
+      const timer = setTimeout(() => {
+        this.pendingRPC.delete(correlationId);
+        reject(new Error("RPC timeout"));
+      }, timeout);
+
+      this.pendingRPC.set(correlationId, { resolve, reject, timer });
+
+      try {
+        this.channel.publish(exchange, routingKey, payload, {
+          persistent: false,
+          ...options,
+          correlationId,
+          replyTo: this.replyQueue,
+        });
+        console.log(`RPC request sent (${routingKey})`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingRPC.delete(correlationId);
+        reject(err);
+      }
+    });
+  }
+
+  async answerRPC(ctx, data) {
+    try {
+      const replyTo = ctx?.properties?.replyTo;
+      const correlationId = ctx?.properties?.correlationId;
+
+      if (!replyTo || !correlationId) {
+        console.warn("RPC reply skipped: missing replyTo or correlationId");
+        return;
+      }
+
+      const payload = Buffer.from(JSON.stringify(data));
+
+      if (!this.isConnectionReady || !this.channel) {
+        console.warn("Channel not ready — queuing RPC response");
+        this.offlineQueue.push({
+          type: "rpc-response",
+          replyTo,
+          correlationId,
+          payload,
+        });
+        return;
+      }
+
+      this.channel.sendToQueue(replyTo, payload, {
+        correlationId,
+        persistent: true,
+      });
+
+      console.log(`RPC response sent to "${replyTo}" (${correlationId})`);
+    } catch (err) {
+      console.error("RPC response error:", err.message);
     }
   }
 

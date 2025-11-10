@@ -1,10 +1,15 @@
 {
   "name": "@shrumec/rabbitmq-client",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Shared RabbitMQ client for Shrumec microservices",
   "main": "index.js",
   "type": "module",
-  "keywords": ["rabbitmq", "amqp", "microservices", "shrumec"],
+  "keywords": [
+    "rabbitmq",
+    "amqp",
+    "microservices",
+    "shrumec"
+  ],
   "author": "Shrumec Team",
   "license": "MIT",
   "dependencies": {
