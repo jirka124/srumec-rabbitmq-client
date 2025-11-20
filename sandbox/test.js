@@ -52,6 +52,7 @@ const consumeFunction = async (content, ctx, queue) => {
     await rabbit2.consume(QUEUE_3, consumeFunction);
 
     console.log("Sandbox ready! Sending test messages...");
+
     rabbit1.publish(EXCHANGE, "sandbox.2", {
       message: "From sandbox-1 to sandbox-2",
     });
@@ -66,7 +67,7 @@ const consumeFunction = async (content, ctx, queue) => {
     rabbit1.publish(EXCHANGE, "apple.delete", {
       message: "From sandbox-1 to subscribers of apple (sandbox-2)",
     });
-    const reqParams = {
+    let reqParams = {
       key: "add_numbers",
       op1: 45,
       op2: 56,
@@ -75,56 +76,69 @@ const consumeFunction = async (content, ctx, queue) => {
     console.log(
       `RPC returned (${reqParams.op1} + ${reqParams.op2}) = ${res1.result}`
     );
-    console.log("TURN OFF RABBITMQ, next text in 20s");
 
-    setTimeout(async () => {
-      console.log("Sending offline messages");
-      console.log("TURN ON RABBITMQ, next text in 20s");
-      rabbit1.publish(EXCHANGE, "sandbox.2", {
-        message: "From sandbox-1 to sandbox-2 while offline",
-      });
+    const closePromise = Promise.all([
+      rabbit1.waitFor("conn-closed"),
+      rabbit2.waitFor("conn-closed"),
+    ]);
 
-      const reqParams = {
-        key: "add_numbers",
-        op1: 1,
-        op2: 2,
-      };
+    const reconnPromise = Promise.all([
+      rabbit1.waitFor("reconnected"),
+      rabbit2.waitFor("reconnected"),
+    ]);
 
-      const res1 = await rabbit1.publishRPC(
-        EXCHANGE,
-        "sandbox.2",
-        reqParams,
-        {},
-        1200000
+    const flushPromise = rabbit1.waitFor("offline-queue-flushed");
+
+    console.log("------ TURN OFF RABBITMQ ------");
+    await closePromise;
+
+    console.log("Sending offline messages");
+    rabbit1.publish(EXCHANGE, "sandbox.2", {
+      message: "From sandbox-1 to sandbox-2 while offline",
+    });
+
+    reqParams = {
+      key: "add_numbers",
+      op1: 1,
+      op2: 2,
+    };
+
+    const offlineRPCPromise = rabbit1
+      .publishRPC(EXCHANGE, "sandbox.2", reqParams, {}, 1200000)
+      .then((res) =>
+        console.log(
+          `RPC returned after offline (${reqParams.op1} + ${reqParams.op2}) = ${res.result}`
+        )
       );
-      console.log(
-        `RPC returned after offline (${reqParams.op1} + ${reqParams.op2}) = ${res1.result}`
-      );
-    }, 20000);
 
-    setTimeout(async () => {
-      console.log("Sending online messages after recovery");
-      rabbit1.publish(EXCHANGE, "sandbox.2", {
-        message: "From sandbox-1 to sandbox-2 after recovery",
-      });
+    console.log("------ TURN ON RABBITMQ ------");
+    await reconnPromise;
+    console.log("------ RABBITMQ RECONNECTED ------");
+    await flushPromise;
+    console.log("------ RABBITMQ FLUSHED ------");
+    await offlineRPCPromise;
 
-      const reqParams = {
-        key: "add_numbers",
-        op1: 1000,
-        op2: 220000,
-      };
+    console.log("Sending online messages after recovery");
+    rabbit1.publish(EXCHANGE, "sandbox.2", {
+      message: "From sandbox-1 to sandbox-2 after recovery",
+    });
 
-      const res1 = await rabbit1.publishRPC(
-        EXCHANGE,
-        "sandbox.2",
-        reqParams,
-        {},
-        1200000
-      );
-      console.log(
-        `RPC returned after recovery (${reqParams.op1} + ${reqParams.op2}) = ${res1.result}`
-      );
-    }, 40000);
+    reqParams = {
+      key: "add_numbers",
+      op1: 1000,
+      op2: 220000,
+    };
+
+    const res3 = await rabbit1.publishRPC(
+      EXCHANGE,
+      "sandbox.2",
+      reqParams,
+      {},
+      1200000
+    );
+    console.log(
+      `RPC returned after recovery (${reqParams.op1} + ${reqParams.op2}) = ${res3.result}`
+    );
   } catch (e) {
     console.error(e);
   }

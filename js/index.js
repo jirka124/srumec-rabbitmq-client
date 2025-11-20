@@ -1,7 +1,8 @@
 import amqp from "amqplib";
+import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
 
-export class RabbitClient {
+export class RabbitClient extends EventEmitter {
   #CONNECTION_RETRY_COUNT = 20;
   #CONNECTION_RETRY_DELAY = 3000;
   #OFFLINE_FLUSH_INTERVAL = 10000;
@@ -16,6 +17,7 @@ export class RabbitClient {
   #flusherTimer;
 
   constructor(url, replyQueueName) {
+    super();
     this.url = url || "amqp://rabbitmq:5672";
     this.connection = null;
     this.sendChannel = null;
@@ -33,6 +35,7 @@ export class RabbitClient {
         this.sendChannel = await this.connection.createConfirmChannel();
         this.recvChannel = await this.connection.createChannel();
         this._registerConnectionHandlers();
+        this._emit("connected", { url: this.url });
         if (opt.isFirstTimeInit) {
           this.#isConnectionReady = true; // connection ready is fired later for reconnect
           await this._registerReplyQueue(); // reply queue will recover from topology recovery
@@ -200,6 +203,14 @@ export class RabbitClient {
     this.#recoveryBindings.get(queue).push({ exchange, routingKey });
   }
 
+  waitFor(event) {
+    return new Promise((resolve) => {
+      this.once(event, (...args) =>
+        resolve(args.length === 1 ? args[0] : args)
+      );
+    });
+  }
+
   _startAutoFlusher(intervalMs = this.#OFFLINE_FLUSH_INTERVAL) {
     if (this.#flusherTimer) clearInterval(this.#flusherTimer);
     this.#flusherTimer = setInterval(async () => {
@@ -221,6 +232,7 @@ export class RabbitClient {
     this.connection.on("close", async () => {
       console.warn("RabbitMQ connection closed, attempting reconnect...");
       this.#isConnectionReady = false;
+      this._emit("conn-closed", { url: this.url });
       await this._reconnect();
     });
   }
@@ -247,9 +259,11 @@ export class RabbitClient {
       try {
         await this.connect(undefined, { isFirstTimeInit: false });
         await this._restoreTopology();
-        await this._flushOfflineQueue();
 
         this.#isConnectionReady = true;
+        this._emit("reconnected", {});
+
+        await this._flushOfflineQueue();
       } catch (err) {
         await this._sleep(this.#CONNECTION_RETRY_DELAY);
       }
@@ -293,7 +307,9 @@ export class RabbitClient {
   }
 
   async _flushOfflineQueue() {
-    while (this.#offlineQueue.length > 0) {
+    const initialLength = this.#offlineQueue.length;
+
+    for (let i = 0; i < initialLength; i++) {
       const msg = this.#offlineQueue.shift();
       try {
         if (msg.type === "rpc-response") {
@@ -308,10 +324,12 @@ export class RabbitClient {
         }
       } catch (err) {
         console.error("Failed to flush queued message:", err.message);
-        this.#offlineQueue.unshift(msg);
-        break;
+        this.#offlineQueue.push(msg);
       }
     }
+
+    if (initialLength && !this.#offlineQueue.length)
+      this._emit("offline-queue-flushed", {});
   }
 
   async _consume(queue, handler) {
@@ -331,6 +349,10 @@ export class RabbitClient {
       },
       { noAck: false }
     );
+  }
+
+  _emit(event, data) {
+    super.emit(event, data);
   }
 
   async _sleep(ms) {
