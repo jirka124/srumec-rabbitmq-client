@@ -1,6 +1,6 @@
 {
   "name": "@shrumec/rabbitmq-client",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Shared RabbitMQ client for Shrumec microservices",
   "main": "index.js",
   "type": "module",
